@@ -124,6 +124,11 @@ function createApp(pool, cfg) {
       id TEXT PRIMARY KEY, client_id INT NOT NULL, kind TEXT NOT NULL, mime TEXT NOT NULL, data BYTEA NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     await pool.query('CREATE INDEX IF NOT EXISTS people_client_idx ON people(client_id)');
+    await pool.query(`CREATE TABLE IF NOT EXISTS audit (
+      id SERIAL PRIMARY KEY, client_id INT NOT NULL, person_id INT, person_name TEXT NOT NULL DEFAULT '',
+      actor TEXT NOT NULL, action TEXT NOT NULL, changes JSONB NOT NULL DEFAULT '{}', ip TEXT NOT NULL DEFAULT '',
+      at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    await pool.query('CREATE INDEX IF NOT EXISTS audit_client_idx ON audit(client_id, id)');
   })();
   app.use((req, res, next) => ready.then(() => next(), next));
 
@@ -190,24 +195,77 @@ function createApp(pool, cfg) {
     if (existing) { if (existing.photo) out.photo = existing.photo; if (existing.photoRound) out.photoRound = existing.photoRound; }
     return out;
   };
+  // ---------- audit log ----------
+  const trunc = (v) => { const t = typeof v === 'string' ? v : JSON.stringify(v === undefined ? '' : v); return t.length > 120 ? t.slice(0, 117) + '...' : t; };
+  const audit = async (client, e) => {
+    try {
+      await pool.query('INSERT INTO audit(client_id, person_id, person_name, actor, action, changes, ip) VALUES($1,$2,$3,$4,$5,$6,$7)',
+        [client.id, e.personId || null, cleanStr(e.personName || '', 100), e.actor, e.action, JSON.stringify(e.changes || {}), cleanStr(e.ip || '', 60)]);
+    } catch (err) { console.error('audit failed', err.message); }
+  };
+  // Autosave fires many updates while someone types: merge consecutive edits to one person by the same actor within 10 minutes
+  const auditPersonUpdate = async (client, pid, name, changes, ctx) => {
+    try {
+      const r = await pool.query('SELECT id, actor, action, changes, at FROM audit WHERE client_id=$1 AND person_id=$2 ORDER BY id DESC LIMIT 1', [client.id, pid]);
+      const last = r.rows[0];
+      if (last && last.action === 'person.update' && last.actor === ctx.actor && Date.now() - new Date(last.at).getTime() < 10 * 60 * 1000) {
+        const merged = {};
+        for (const k of Object.keys(last.changes)) merged[k] = [last.changes[k][0], changes[k] ? changes[k][1] : last.changes[k][1]];
+        for (const k of Object.keys(changes)) if (!merged[k]) merged[k] = changes[k];
+        for (const k of Object.keys(merged)) if (merged[k][0] === merged[k][1]) delete merged[k];
+        if (!Object.keys(merged).length) await pool.query('DELETE FROM audit WHERE id=$1', [last.id]);
+        else await pool.query('UPDATE audit SET changes=$1, at=now(), person_name=$2 WHERE id=$3', [JSON.stringify(merged), name, last.id]);
+        return;
+      }
+      await audit(client, { personId: pid, personName: name, actor: ctx.actor, action: 'person.update', changes, ip: ctx.ip });
+    } catch (err) { console.error('audit failed', err.message); }
+  };
+  const stable = (v) => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x)) ? Object.keys(x).sort().reduce((a, kk) => { a[kk] = x[kk]; return a; }, {}) : x);
+  const flat = (o, pre, out, depth) => {
+    for (const k of Object.keys(o || {})) {
+      const v = o[k], p = pre ? pre + '.' + k : k;
+      if (Array.isArray(v) && v.length <= 30 && v.every((i) => i && typeof i === 'object' && !Array.isArray(i)) && depth < 4) {
+        out[p + '.count'] = v.length;
+        v.forEach((item, i) => flat(item, p + '.' + (item.key || i), out, depth + 1));
+      } else if (v && typeof v === 'object' && !Array.isArray(v) && depth < 4) flat(v, p, out, depth + 1);
+      else out[p] = v;
+    }
+    return out;
+  };
+  const diffDesign = (a, b) => {
+    const fa = flat(a, '', {}, 0), fb = flat(b, '', {}, 0), ch = {};
+    for (const k of new Set([...Object.keys(fa), ...Object.keys(fb)])) {
+      if (stable(fa[k]) !== stable(fb[k])) { ch[k] = [trunc(fa[k]), trunc(fb[k])]; if (Object.keys(ch).length >= 40) break; }
+    }
+    return ch;
+  };
+
   const peopleOps = {
-    async create(client, body) {
+    async create(client, body, ctx) {
       const data = cleanPerson(body && body.data);
       const r = await pool.query('INSERT INTO people(client_id, data) VALUES($1,$2) RETURNING id, data, updated_at', [client.id, data]);
+      await audit(client, { personId: r.rows[0].id, personName: data.name, actor: ctx.actor, action: 'person.create', ip: ctx.ip });
       return r.rows[0];
     },
-    async update(client, pid, body) {
+    async update(client, pid, body, ctx) {
       const cur = await pool.query('SELECT data FROM people WHERE id=$1 AND client_id=$2', [pid, client.id]);
       if (!cur.rows.length) return null;
-      const data = cleanPerson(body && body.data, cur.rows[0].data);
+      const old = cur.rows[0].data;
+      const data = cleanPerson(body && body.data, old);
+      const changes = {};
+      for (const k of PERSON_KEYS) if ((old[k] || '') !== (data[k] || '')) changes[k] = [old[k] || '', data[k] || ''];
       const r = await pool.query('UPDATE people SET data=$1, updated_at=now() WHERE id=$2 AND client_id=$3 RETURNING id, data, updated_at', [data, pid, client.id]);
+      if (Object.keys(changes).length) await auditPersonUpdate(client, pid, data.name || old.name, changes, ctx);
       return r.rows[0];
     },
-    async remove(client, pid) {
-      const r = await pool.query('DELETE FROM people WHERE id=$1 AND client_id=$2 RETURNING id', [pid, client.id]);
-      return r.rows.length > 0;
+    async remove(client, pid, ctx) {
+      const cur = await pool.query('SELECT data FROM people WHERE id=$1 AND client_id=$2', [pid, client.id]);
+      if (!cur.rows.length) return false;
+      await pool.query('DELETE FROM people WHERE id=$1 AND client_id=$2', [pid, client.id]);
+      await audit(client, { personId: pid, personName: cur.rows[0].data.name, actor: ctx.actor, action: 'person.delete', changes: { snapshot: cur.rows[0].data }, ip: ctx.ip });
+      return true;
     },
-    async photo(client, pid, variant, buf) {
+    async photo(client, pid, variant, buf, ctx) {
       const mime = sniffImage(buf);
       if (!mime) return { status: 400, error: 'Image must be PNG, JPG or GIF' };
       if (buf.length > 1.5 * 1024 * 1024) return { status: 400, error: 'Image too large (max 1.5MB)' };
@@ -218,14 +276,19 @@ function createApp(pool, cfg) {
       const data = Object.assign({}, cur.rows[0].data);
       if (variant === 'round') data.photoRound = id; else data.photo = id;
       const r = await pool.query('UPDATE people SET data=$1, updated_at=now() WHERE id=$2 RETURNING id, data, updated_at', [data, pid]);
+      const last = await pool.query('SELECT action, actor, at FROM audit WHERE client_id=$1 AND person_id=$2 ORDER BY id DESC LIMIT 1', [client.id, pid]);
+      const l = last.rows[0];
+      if (!(l && l.action === 'person.photo' && l.actor === ctx.actor && Date.now() - new Date(l.at).getTime() < 60 * 1000))
+        await audit(client, { personId: pid, personName: data.name, actor: ctx.actor, action: 'person.photo', changes: { photo: ['', 'uploaded new photo'] }, ip: ctx.ip });
       return { row: r.rows[0] };
     },
-    async clearPhoto(client, pid) {
+    async clearPhoto(client, pid, ctx) {
       const cur = await pool.query('SELECT data FROM people WHERE id=$1 AND client_id=$2', [pid, client.id]);
       if (!cur.rows.length) return null;
       const data = Object.assign({}, cur.rows[0].data);
       delete data.photo; delete data.photoRound;
       const r = await pool.query('UPDATE people SET data=$1, updated_at=now() WHERE id=$2 RETURNING id, data, updated_at', [data, pid]);
+      await audit(client, { personId: pid, personName: data.name, actor: ctx.actor, action: 'person.photo', changes: { photo: ['photo', 'removed'] }, ip: ctx.ip });
       return r.rows[0];
     },
   };
@@ -259,7 +322,8 @@ function createApp(pool, cfg) {
     if (limited(key)) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
     const client = await getClientBySlug(req.params.slug);
     const ok = client && verifyPassword(String(req.body && req.body.password || ''), client.pw_hash);
-    if (!ok) { noteFail(key); return res.status(401).json({ error: 'Incorrect password' }); }
+    if (!ok) { noteFail(key); if (client) await audit(client, { actor: 'client', action: 'login_failed', ip: req.ip }); return res.status(401).json({ error: 'Incorrect password' }); }
+    await audit(client, { actor: 'client', action: 'login', ip: req.ip });
     const maxAge = 7 * 24 * 3600;
     setCookie(req, res, 'sig_c_' + client.slug, sign({ r: 'client', cid: client.id, v: pwFingerprint(client.pw_hash), exp: Date.now() + maxAge * 1000 }), maxAge);
     res.json({ ok: true });
@@ -276,27 +340,27 @@ function createApp(pool, cfg) {
 
   app.post('/api/c/:slug/people', clientAuth, json, wrap(async (req, res) => {
     if (!perm(req.client, 'add')) return res.status(403).json({ error: 'Adding people is disabled for this account' });
-    res.json(await peopleOps.create(req.client, req.body));
+    res.json(await peopleOps.create(req.client, req.body, { actor: 'client', ip: req.ip }));
   }));
   app.put('/api/c/:slug/people/:pid', clientAuth, json, wrap(async (req, res) => {
-    const row = await peopleOps.update(req.client, +req.params.pid, req.body);
+    const row = await peopleOps.update(req.client, +req.params.pid, req.body, { actor: 'client', ip: req.ip });
     if (!row) return res.status(404).json({ error: 'Not found' });
     res.json(row);
   }));
   app.delete('/api/c/:slug/people/:pid', clientAuth, wrap(async (req, res) => {
     if (!perm(req.client, 'remove')) return res.status(403).json({ error: 'Removing people is disabled for this account' });
-    const ok = await peopleOps.remove(req.client, +req.params.pid);
+    const ok = await peopleOps.remove(req.client, +req.params.pid, { actor: 'client', ip: req.ip });
     res.status(ok ? 200 : 404).json({ ok });
   }));
   app.post('/api/c/:slug/people/:pid/photo', clientAuth, rawImg, wrap(async (req, res) => {
     if (!perm(req.client, 'photo')) return res.status(403).json({ error: 'Photo uploads are disabled for this account' });
-    const r = await peopleOps.photo(req.client, +req.params.pid, req.query.variant, req.body);
+    const r = await peopleOps.photo(req.client, +req.params.pid, req.query.variant, req.body, { actor: 'client', ip: req.ip });
     if (r.error) return res.status(r.status).json({ error: r.error });
     res.json(r.row);
   }));
   app.delete('/api/c/:slug/people/:pid/photo', clientAuth, wrap(async (req, res) => {
     if (!perm(req.client, 'photo')) return res.status(403).json({ error: 'Photo uploads are disabled for this account' });
-    const row = await peopleOps.clearPhoto(req.client, +req.params.pid);
+    const row = await peopleOps.clearPhoto(req.client, +req.params.pid, { actor: 'client', ip: req.ip });
     if (!row) return res.status(404).json({ error: 'Not found' });
     res.json(row);
   }));
@@ -333,7 +397,9 @@ function createApp(pool, cfg) {
     const r = await pool.query('SELECT id, slug, name, updated_at, created_at FROM clients ORDER BY lower(name)');
     const counts = await pool.query('SELECT client_id, count(*) AS n FROM people GROUP BY client_id');
     const m = {}; counts.rows.forEach((c) => { m[c.client_id] = +c.n; });
-    res.json(r.rows.map((c) => ({ ...c, people: m[c.id] || 0 })));
+    const last = await pool.query("SELECT client_id, max(at) AS at FROM audit WHERE actor='client' AND action LIKE 'person.%' GROUP BY client_id");
+    const le = {}; last.rows.forEach((x) => { le[x.client_id] = x.at; });
+    res.json(r.rows.map((c) => ({ ...c, people: m[c.id] || 0, last_client_edit: le[c.id] || null })));
   }));
 
   app.post('/api/admin/clients', adminAuth, json, wrap(async (req, res) => {
@@ -374,6 +440,10 @@ function createApp(pool, cfg) {
     const design = b.design && typeof b.design === 'object' ? b.design : c.design;
     const notes = b.notes !== undefined ? cleanStr(b.notes, 4000) : c.notes;
     await pool.query('UPDATE clients SET name=$1, slug=$2, design=$3, notes=$4, updated_at=now() WHERE id=$5', [name, slug, design, notes, c.id]);
+    const dch = diffDesign(c.design, design);
+    if (Object.keys(dch).length) await audit(c, { actor: 'admin', action: 'design.update', changes: dch, ip: req.ip });
+    if (name !== c.name) await audit(c, { actor: 'admin', action: 'client.rename', changes: { name: [c.name, name] }, ip: req.ip });
+    if (slug !== c.slug) await audit(c, { actor: 'admin', action: 'client.slug', changes: { slug: [c.slug, slug] }, ip: req.ip });
     res.json({ ok: true, slug });
   }));
 
@@ -382,11 +452,13 @@ function createApp(pool, cfg) {
     if (password && password.length < 8) return res.status(400).json({ error: 'Password must be 8+ characters' });
     if (!password) password = readablePassword();
     await pool.query('UPDATE clients SET pw_hash=$1, updated_at=now() WHERE id=$2', [hashPassword(password), req.client.id]);
+    await audit(req.client, { actor: 'admin', action: 'password.reset', ip: req.ip });
     res.json({ password });
   }));
 
   app.delete('/api/admin/clients/:id', adminAuth, adminClient, wrap(async (req, res) => {
     const id = req.client.id;
+    await pool.query('DELETE FROM audit WHERE client_id=$1', [id]);
     await pool.query('DELETE FROM images WHERE client_id=$1', [id]);
     await pool.query('DELETE FROM people WHERE client_id=$1', [id]);
     await pool.query('DELETE FROM clients WHERE id=$1', [id]);
@@ -405,26 +477,64 @@ function createApp(pool, cfg) {
 
   // admin-side people management (same rules, no permission flags)
   app.post('/api/admin/clients/:id/people', adminAuth, adminClient, json, wrap(async (req, res) => {
-    res.json(await peopleOps.create(req.client, req.body));
+    res.json(await peopleOps.create(req.client, req.body, { actor: 'admin', ip: req.ip }));
   }));
   app.put('/api/admin/clients/:id/people/:pid', adminAuth, adminClient, json, wrap(async (req, res) => {
-    const row = await peopleOps.update(req.client, +req.params.pid, req.body);
+    const row = await peopleOps.update(req.client, +req.params.pid, req.body, { actor: 'admin', ip: req.ip });
     if (!row) return res.status(404).json({ error: 'Not found' });
     res.json(row);
   }));
   app.delete('/api/admin/clients/:id/people/:pid', adminAuth, adminClient, wrap(async (req, res) => {
-    const ok = await peopleOps.remove(req.client, +req.params.pid);
+    const ok = await peopleOps.remove(req.client, +req.params.pid, { actor: 'admin', ip: req.ip });
     res.status(ok ? 200 : 404).json({ ok });
   }));
   app.post('/api/admin/clients/:id/people/:pid/photo', adminAuth, adminClient, rawImg, wrap(async (req, res) => {
-    const r = await peopleOps.photo(req.client, +req.params.pid, req.query.variant, req.body);
+    const r = await peopleOps.photo(req.client, +req.params.pid, req.query.variant, req.body, { actor: 'admin', ip: req.ip });
     if (r.error) return res.status(r.status).json({ error: r.error });
     res.json(r.row);
   }));
   app.delete('/api/admin/clients/:id/people/:pid/photo', adminAuth, adminClient, wrap(async (req, res) => {
-    const row = await peopleOps.clearPhoto(req.client, +req.params.pid);
+    const row = await peopleOps.clearPhoto(req.client, +req.params.pid, { actor: 'admin', ip: req.ip });
     if (!row) return res.status(404).json({ error: 'Not found' });
     res.json(row);
+  }));
+
+  // ---------- activity log ----------
+  app.get('/api/admin/clients/:id/audit', adminAuth, adminClient, wrap(async (req, res) => {
+    const limit = Math.min(200, +req.query.limit || 100), before = +req.query.before || 0;
+    const params = [req.client.id];
+    let sql = 'SELECT id, person_id, person_name, actor, action, changes, ip, at FROM audit WHERE client_id=$1';
+    if (before) { params.push(before); sql += ` AND id<$${params.length}`; }
+    if (req.query.actor === 'client' || req.query.actor === 'admin') { params.push(req.query.actor); sql += ` AND actor=$${params.length}`; }
+    if (req.query.logins !== '1') sql += " AND action NOT IN ('login','login_failed')";
+    params.push(limit + 1); sql += ` ORDER BY id DESC LIMIT $${params.length}`;
+    const r = await pool.query(sql, params);
+    res.json({ rows: r.rows.slice(0, limit), more: r.rows.length > limit });
+  }));
+
+  app.post('/api/admin/clients/:id/audit/:aid/revert', adminAuth, adminClient, wrap(async (req, res) => {
+    const r = await pool.query('SELECT * FROM audit WHERE id=$1 AND client_id=$2', [+req.params.aid, req.client.id]);
+    const a = r.rows[0];
+    if (!a) return res.status(404).json({ error: 'Not found' });
+    const ctx = { actor: 'admin', ip: req.ip };
+    if (a.action === 'person.update' && a.person_id) {
+      const cur = await pool.query('SELECT data FROM people WHERE id=$1 AND client_id=$2', [a.person_id, req.client.id]);
+      if (!cur.rows.length) return res.status(409).json({ error: 'That person no longer exists' });
+      const data = Object.assign({}, cur.rows[0].data), rev = {};
+      for (const k of Object.keys(a.changes)) if (PERSON_KEYS.includes(k)) { rev[k] = [data[k] || '', a.changes[k][0]]; data[k] = a.changes[k][0]; }
+      await pool.query('UPDATE people SET data=$1, updated_at=now() WHERE id=$2', [data, a.person_id]);
+      await audit(req.client, { personId: a.person_id, personName: data.name, actor: 'admin', action: 'person.revert', changes: rev, ip: ctx.ip });
+      return res.json({ ok: true });
+    }
+    if (a.action === 'person.delete' && a.changes && a.changes.snapshot) {
+      const data = cleanPerson(a.changes.snapshot, a.changes.snapshot);
+      let ins;
+      try { ins = await pool.query('INSERT INTO people(id, client_id, data) VALUES($1,$2,$3) RETURNING id', [a.person_id, req.client.id, data]); }  // keep the old id so earlier log entries still point at them
+      catch (e) { ins = await pool.query('INSERT INTO people(client_id, data) VALUES($1,$2) RETURNING id', [req.client.id, data]); }
+      await audit(req.client, { personId: ins.rows[0].id, personName: data.name, actor: 'admin', action: 'person.restore', ip: ctx.ip });
+      return res.json({ ok: true });
+    }
+    res.status(400).json({ error: 'This entry cannot be reverted' });
   }));
 
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));

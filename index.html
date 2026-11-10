@@ -95,6 +95,13 @@ input[type=color]{width:38px;height:32px;padding:2px;border:1px solid var(--line
 .cropbox{width:280px;height:280px;margin:0 auto 12px;border-radius:8px;overflow:hidden;background:#222;touch-action:none;cursor:grab}
 .cropbox canvas{display:block}
 .note{background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px 12px;margin:0 0 14px}
+.presets{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.pbtn{border:1px solid var(--line);background:#fff;border-radius:8px;padding:0;cursor:pointer;overflow:hidden;text-align:center;font-size:12px;font-weight:600}
+.pbtn:hover{border-color:var(--acc)}
+.pbtn .thumb{height:84px;overflow:hidden;position:relative;background:#fff;pointer-events:none}
+.pbtn .thumb>table{transform:scale(.3);transform-origin:0 0;margin:8px 0 0 8px}
+.pbtn span{display:block;padding:5px;border-top:1px solid var(--line)}
+.quick{margin-bottom:6px}
 @media(max-width:900px){.split,.ws{grid-template-columns:1fr}.sticky{position:static}.ctl{max-height:none}}
 </style>
 </head>
@@ -193,8 +200,9 @@ const DEFAULT_DESIGN = {
   colors: { accent: '#e4572e', name: '#111111', text: '#444444', link: '#e4572e', label: '#e4572e', divider: '#d9d9d9', muted: '#8a8a8a' },
   logo: { id: '', w: 0, h: 0, width: 130, alt: '' },
   photo: { size: 90, shape: 'round' },
-  socials: { style: 'square', size: 26, gap: 5, items: Object.fromEntries(Object.keys(NETS).map(k => [k, { on: false, url: '', perPerson: false }])) },
+  socials: { style: 'square', size: 26, gap: 5, bg: '', custom: [], items: Object.fromEntries(Object.keys(NETS).map(k => [k, { on: false, url: '', perPerson: false, iconId: '', iw: 0, ih: 0 }])) },
   banner: { on: false, id: '', w: 0, h: 0, width: 420, link: '', alt: '' },
+  dark: { on: false, colors: { accent: '#ff7a55', name: '#ffffff', text: '#d6d9de', link: '#ff7a55', label: '#ff7a55', divider: '#4a4f58', muted: '#9aa0aa' }, logo: { id: '', w: 0, h: 0 } },
   closing: '', disclaimer: { on: false, text: '' },
   perm: { add: true, remove: true, photo: true }, portalNote: '',
   fields: FIELD_DEFS.map(f => ({ key: f.key, label: f.label, letter: f.letter || '', on: f.on }))
@@ -219,23 +227,45 @@ function mergeDesign(saved) {
 const SAMPLE = { name: 'Alex Morgan', title: 'Marketing Director', department: 'Brand & Growth', company: 'Example Co', phone: '+61 8 8123 4567', mobile: '0400 123 456', email: 'alex.morgan@example.com', website: 'www.example.com', address: 'Level 2, 123 Example St, Adelaide SA 5000', extra1: 'Mon – Thu', extra2: '' };
 const PLACEHOLDER = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120"><rect width="120" height="120" fill="#d7dae0"/><circle cx="60" cy="46" r="20" fill="#fff"/><path d="M20 120c4-28 22-40 40-40s36 12 40 40z" fill="#fff"/></svg>');
 
+/* ---------- colour helpers ---------- */
+const hex2rgb = h => { h = String(h).replace('#', ''); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16) || 0); };
+const rgb2hex = a => '#' + a.map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
+const lum = h => { const [r, g, b] = hex2rgb(h).map(v => { v /= 255; return v <= .03928 ? v / 12.92 : Math.pow((v + .055) / 1.055, 2.4); }); return .2126 * r + .7152 * g + .0722 * b; };
+const contrast = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + .05) / (Math.min(x, y) + .05); };
+const mixHex = (a, b, t) => { const A = hex2rgb(a), B = hex2rgb(b); return rgb2hex(A.map((v, i) => v + (B[i] - v) * t)); };
+const ensureContrast = (hex, bg, min) => { let c = hex, n = 0; while (contrast(c, bg) < min && n++ < 30) c = mixHex(c, '#ffffff', .08); return c; };
+const DARK_BG = '#1b1d22';
+// Mid-tone colour that keeps >=3.5:1 contrast on both white and the dark background (works with rich paste, Gmail, etc.)
+function darkSafe(hex) { let c = hex, n = 0; while (lum(c) < .17 && n++ < 40) c = mixHex(c, '#ffffff', .06); n = 0; while (lum(c) > .25 && n++ < 40) c = mixHex(c, '#000000', .06); return c; }
+function autoDark(c) {
+  return { name: '#ffffff', text: '#d6d9de', muted: '#9aa0aa', divider: '#4a4f58', accent: ensureContrast(c.accent, DARK_BG, 4.5), link: ensureContrast(c.link, DARK_BG, 4.5), label: ensureContrast(c.label, DARK_BG, 4.5) };
+}
+
 /* =====================================================================
    Email-safe signature renderer
-   Rules: nested tables, inline styles only, attribute widths/heights, bgcolor attrs,
-   no CSS classes / flex / grid / background images / SVG / web fonts, absolute image URLs.
+   Rules: nested tables, inline styles, attribute widths/heights, bgcolor attrs, no flex/grid/background
+   images/SVG/web fonts, absolute image URLs. The only non-inline CSS is an optional dark-mode
+   @media block (ignored harmlessly by clients that strip <style>).
    ===================================================================== */
 function renderSignature(d, p, o) {
   o = o || {}; p = p || {};
   const origin = o.origin || location.origin;
-  const colors = d.colors || {};
+  const dk = d.dark && d.dark.on ? d.dark : null;
+  const forceDark = !!(dk && o.forceDark);       // preview: bake dark colours inline
+  const mq = !!(dk && !forceDark);               // output: light inline + dark @media overrides
+  const colors = forceDark ? Object.assign({}, d.colors, dk.colors) : (d.colors || {});
   const col = k => /^#[0-9a-f]{6}$/i.test(colors[k] || '') ? colors[k] : DEFAULT_DESIGN.colors[k];
+  const K = (...roles) => mq ? ` class="${roles.map(r => 'sig-' + r).join(' ')}"` : '';
   const S = Math.max(9, +d.size || 13), LH = Math.round(S * 1.5), NS = Math.max(S, +d.nameSize || 17);
   const base = `font-family:${d.font};font-size:${S}px;line-height:${LH}px;mso-line-height-rule:exactly;color:${col('text')};`;
-  const T = (inner, style, attrs) => `<table role="presentation" cellpadding="0" cellspacing="0" border="0"${attrs || ''} style="border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;${style || ''}">${inner}</table>`;
-  const R = (inner, style, attrs) => `<tr><td${attrs || ''} style="${base}${style || ''}">${inner}</td></tr>\n`;
+  const T = (inner, style) => `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;${style || ''}">${inner}</table>`;
+  const R = (inner, style, roles) => `<tr><td${K(...(roles || ['t']))} style="${base}${style || ''}">${inner}</td></tr>\n`;
   const safeUrl = u => { u = String(u || '').trim(); if (!u) return ''; if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) u = 'https://' + u; return /^https?:\/\//i.test(u) ? u : ''; };
-  const A = (href, text, extra) => `<a href="${esc(href)}" target="_blank" style="color:${col('link')};text-decoration:${d.underline ? 'underline' : 'none'};${extra || ''}"><span style="color:${col('link')};text-decoration:${d.underline ? 'underline' : 'none'};">${esc(text)}</span></a>`;
+  const ul = d.underline ? 'underline' : 'none';
+  const A = (href, text, extra) => `<a href="${esc(href)}" target="_blank"${K('l')} style="color:${col('link')};text-decoration:${ul};${extra || ''}"><span${K('l')} style="color:${col('link')};text-decoration:${ul};">${esc(text)}</span></a>`;
   const IMG = (src, w, h, alt, extra) => `<img src="${esc(src)}" width="${w}"${h ? ` height="${h}"` : ''} alt="${esc(alt || '')}" border="0" style="display:block;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;width:${w}px;${h ? `height:${h}px;` : 'height:auto;'}${extra || ''}">`;
+  const src = id => origin + '/i/' + id;
+  const ratio = (im, w) => im && im.w ? Math.round(w * im.h / im.w) : 0;
   const fieldCfg = {}; (d.fields || []).forEach(f => fieldCfg[f.key] = f);
   const on = k => fieldCfg[k] ? !!fieldCfg[k].on : false;
   const val = k => {
@@ -245,31 +275,39 @@ function renderSignature(d, p, o) {
     return v;
   };
 
-  // ---- images
+  // ---- images (logo can swap to a dark-background version)
   const logoOK = !!(d.logo && d.logo.id);
   const lw = logoOK ? Math.max(20, +d.logo.width || 120) : 0;
-  const lh = logoOK && d.logo.w ? Math.round(lw * d.logo.h / d.logo.w) : 0;
-  const logoSmall = (w) => { const h = d.logo.w ? Math.round(w * d.logo.h / d.logo.w) : 0; return IMG(origin + '/i/' + d.logo.id, w, h, d.logo.alt || o.clientName || ''); };
+  const darkLogo = !!(dk && dk.logo && dk.logo.id);
+  const logoSmall = (w) => {
+    const alt = d.logo.alt || o.clientName || '';
+    const light = IMG(src(d.logo.id), w, ratio(d.logo, w), alt);
+    if (!darkLogo) return light;
+    const dark = IMG(src(dk.logo.id), w, ratio(dk.logo, w), alt);
+    if (forceDark) return dark;
+    return light.replace('<img ', '<img class="sig-lt" ') +
+      dark.replace('<img ', '<img class="sig-dk" ').replace('style="display:block;', 'style="display:none;mso-hide:all;max-height:0;overflow:hidden;');
+  };
   const logoImg = () => logoSmall(lw);
   let leftHtml = '', usedLogoLeft = false;
   const psz = Math.max(40, +(d.photo && d.photo.size) || 90);
   if (d.imageSlot === 'photo') {
     const pid = d.photo.shape === 'round' ? (p.photoRound || p.photo) : (p.photo || p.photoRound);
-    if (pid) leftHtml = IMG(origin + '/i/' + pid, psz, psz, p.name || '');
+    if (pid) leftHtml = IMG(src(pid), psz, psz, p.name || '');
     else if (o.placeholder) leftHtml = IMG(PLACEHOLDER, psz, psz, '', d.photo.shape === 'round' ? 'border-radius:50%;' : '');
     else if (logoOK) { leftHtml = logoImg(); usedLogoLeft = true; }
   } else if (d.imageSlot === 'logo' && logoOK) { leftHtml = logoImg(); usedLogoLeft = true; }
   const logoBelow = (d.imageSlot === 'photo' && !usedLogoLeft && logoOK && d.logoWithPhoto !== false) ? logoSmall(Math.min(lw, 140)) : '';
 
   // ---- identity
-  const sep = `<span style="color:${col('divider')};">&nbsp;|&nbsp;</span>`;
+  const sep = `<span${K('d')} style="color:${col('divider')};">&nbsp;|&nbsp;</span>`;
   const name = (p.name || (o.sample ? SAMPLE.name : '')).trim();
   const titleParts = [val('title'), val('department')].filter(Boolean);
   const company = val('company');
   const nameStyle = `font-size:${NS}px;line-height:${Math.round(NS * 1.3)}px;font-weight:bold;color:${col('name')};`;
-  const idRows = (name ? R(esc(name), nameStyle) : '') +
+  const idRows = (name ? R(esc(name), nameStyle, ['n']) : '') +
     (titleParts.length ? R(titleParts.map(esc).join(sep), 'color:' + col('text') + ';') : '') +
-    (company ? R(esc(company), `font-weight:bold;color:${col('accent')};`) : '');
+    (company ? R(esc(company), `font-weight:bold;color:${col('accent')};`, ['a']) : '');
 
   // ---- contacts
   const valHtml = (k, v) => {
@@ -281,71 +319,81 @@ function renderSignature(d, p, o) {
   const contactItems = (d.fields || []).filter(f => FIELD_DEFS.find(x => x.key === f.key && x.group === 'contact')).map(f => ({ f, v: val(f.key) })).filter(x => x.v);
   const rg = Math.max(0, +d.rowGap || 0);
   const labelStyle = `color:${col('label')};font-weight:bold;`;
+  const lab = t => `<span${K('lb')} style="${labelStyle}">${esc(t)}</span>`;
   let contactsHtml = '';
   if (contactItems.length) {
     if (d.layout === 'compact') {
-      contactsHtml = contactItems.map(({ f, v }) => {
-        const lab = d.labels === 'letter' && f.letter ? `<span style="${labelStyle}">${esc(f.letter)}</span>&nbsp;` : d.labels === 'word' ? `<span style="${labelStyle}">${esc(f.label)}</span>&nbsp;` : '';
-        return lab + valHtml(f.key, v);
-      }).join(sep);
+      contactsHtml = contactItems.map(({ f, v }) => (d.labels === 'letter' && f.letter ? lab(f.letter) + '&nbsp;' : d.labels === 'word' ? lab(f.label) + '&nbsp;' : '') + valHtml(f.key, v)).join(sep);
     } else if (d.labels === 'letter') {
-      contactsHtml = T(contactItems.map(({ f, v }) => `<tr><td valign="top" style="${base}${labelStyle}padding:0 8px ${rg}px 0;width:14px;">${esc(f.letter || '')}</td><td valign="top" style="${base}padding:0 0 ${rg}px 0;">${valHtml(f.key, v)}</td></tr>\n`).join(''));
+      contactsHtml = T(contactItems.map(({ f, v }) => `<tr><td valign="top"${K('lb')} style="${base}${labelStyle}padding:0 8px ${rg}px 0;width:14px;">${esc(f.letter || '')}</td><td valign="top"${K('t')} style="${base}padding:0 0 ${rg}px 0;">${valHtml(f.key, v)}</td></tr>\n`).join(''));
     } else {
-      contactsHtml = T(contactItems.map(({ f, v }) => `<tr><td valign="top" style="${base}padding:0 0 ${rg}px 0;">${d.labels === 'word' ? `<span style="${labelStyle}">${esc(f.label)}</span>&nbsp;&nbsp;` : ''}${valHtml(f.key, v)}</td></tr>\n`).join(''));
+      contactsHtml = T(contactItems.map(({ f, v }) => `<tr><td valign="top"${K('t')} style="${base}padding:0 0 ${rg}px 0;">${d.labels === 'word' ? lab(f.label) + '&nbsp;&nbsp;' : ''}${valHtml(f.key, v)}</td></tr>\n`).join(''));
     }
   }
 
-  // ---- socials
+  // ---- socials: built-in glyphs, per-network uploaded icons, custom links
   const socials = d.socials || DEFAULT_DESIGN.socials;
-  const socItems = Object.keys(NETS).map(k => {
-    const c = (socials.items || {})[k]; if (!c || !c.on) return null;
+  const sItems = [];
+  Object.keys(NETS).forEach(k => {
+    const c = (socials.items || {})[k]; if (!c || !c.on) return;
     let url = (c.perPerson && p['social_' + k]) ? p['social_' + k] : c.url;
     if (!url && o.sample) url = 'https://example.com';
-    url = safeUrl(url);
-    return url ? { k, url } : null;
-  }).filter(Boolean);
+    url = safeUrl(url); if (!url) return;
+    sItems.push({ label: NETS[k], url, glyph: k, icon: c.iconId ? { id: c.iconId, w: c.iw, h: c.ih } : null });
+  });
+  (socials.custom || []).forEach(c => {
+    const url = safeUrl(c.url || (o.sample ? 'https://example.com' : ''));
+    if (url && (c.label || c.iconId)) sItems.push({ label: c.label || 'Link', url, glyph: null, icon: c.iconId ? { id: c.iconId, w: c.w, h: c.h } : null });
+  });
   let socialsHtml = '';
-  if (socItems.length) {
+  if (sItems.length) {
     if (socials.style === 'text') {
-      socialsHtml = socItems.map(i => A(i.url, NETS[i.k], 'font-weight:bold;')).join(sep);
+      socialsHtml = sItems.map(i => A(i.url, i.label, 'font-weight:bold;')).join(sep);
     } else {
       const sz = Math.max(18, +socials.size || 26), ico = Math.round(sz * 0.58), pad = Math.floor((sz - ico) / 2), gp = Math.max(0, +socials.gap || 0);
       const radius = socials.style === 'circle' ? 'border-radius:50%;' : socials.style === 'rounded' ? 'border-radius:5px;' : '';
-      socialsHtml = T('<tr>' + socItems.map((i, n) =>
-        `<td bgcolor="${col('accent')}" valign="middle" style="background-color:${col('accent')};padding:${pad}px;${radius}"><a href="${esc(i.url)}" target="_blank" style="text-decoration:none;">${IMG(origin + '/icons/' + i.k + '.png', ico, ico, NETS[i.k])}</a></td>` +
-        (n < socItems.length - 1 ? `<td width="${gp}" style="width:${gp}px;font-size:1px;line-height:1px;">&nbsp;</td>` : '')).join('') + '</tr>');
+      const customBg = /^#[0-9a-f]{6}$/i.test(socials.bg || '');
+      const tile = customBg ? socials.bg : col('accent');
+      const tileCls = customBg ? '' : K('bg');
+      socialsHtml = T('<tr>' + sItems.map((i, n) => {
+        let cell;
+        if (i.icon) cell = `<td valign="middle"><a href="${esc(i.url)}" target="_blank" style="text-decoration:none;">${IMG(src(i.icon.id), sz, ratio(i.icon, sz) || sz, i.label)}</a></td>`;
+        else if (i.glyph) cell = `<td bgcolor="${tile}" valign="middle"${tileCls} style="background-color:${tile};padding:${pad}px;${radius}"><a href="${esc(i.url)}" target="_blank" style="text-decoration:none;">${IMG(origin + '/icons/' + i.glyph + '.png', ico, ico, i.label)}</a></td>`;
+        else cell = `<td bgcolor="${tile}" width="${sz}" height="${sz}" align="center" valign="middle"${tileCls} style="background-color:${tile};width:${sz}px;height:${sz}px;${radius}"><a href="${esc(i.url)}" target="_blank" style="text-decoration:none;color:#ffffff;font-family:Arial,Helvetica,sans-serif;font-weight:bold;font-size:${Math.round(sz * .5)}px;line-height:${sz}px;">${esc((i.label || '?').charAt(0).toUpperCase())}</a></td>`;
+        return cell + (n < sItems.length - 1 ? `<td width="${gp}" style="width:${gp}px;font-size:1px;line-height:1px;">&nbsp;</td>` : '');
+      }).join('') + '</tr>');
     }
   }
 
   // ---- banner / disclaimer / closing
   let bannerHtml = '';
   if (d.banner && d.banner.on && d.banner.id) {
-    const bw = Math.max(40, +d.banner.width || 420), bh = d.banner.w ? Math.round(bw * d.banner.h / d.banner.w) : 0;
-    const im = IMG(origin + '/i/' + d.banner.id, bw, bh, d.banner.alt || '');
+    const bw = Math.max(40, +d.banner.width || 420);
+    const im = IMG(src(d.banner.id), bw, ratio(d.banner, bw), d.banner.alt || '');
     const bl = safeUrl(d.banner.link);
     bannerHtml = bl ? `<a href="${esc(bl)}" target="_blank" style="text-decoration:none;border:0;">${im}</a>` : im;
   }
   const disc = d.disclaimer && d.disclaimer.on && String(d.disclaimer.text || '').trim()
-    ? R(esc(d.disclaimer.text.trim()).replace(/\n/g, '<br>'), `font-size:${Math.max(9, S - 3)}px;line-height:${Math.round((S - 3) * 1.4)}px;color:${col('muted')};padding-top:12px;`) : '';
+    ? R(esc(d.disclaimer.text.trim()).replace(/\n/g, '<br>'), `font-size:${Math.max(9, S - 3)}px;line-height:${Math.round((S - 3) * 1.4)}px;color:${col('muted')};padding-top:12px;`, ['m']) : '';
   const closing = String(d.closing || '').trim() ? R(esc(d.closing.trim()).replace(/\n/g, '<br>'), 'padding-bottom:12px;') : '';
   const bannerRow = bannerHtml ? R(bannerHtml, 'padding-top:12px;') : '';
 
   // ---- layouts
   const dw = Math.max(1, +d.dividerWidth || 1), gp = Math.max(6, +d.gap || 16);
+  const dv = `border-top:${dw}px solid ${col('divider')};`;
   let body = '';
   if (d.layout === 'stacked') {
-    const dv = `border-top:${dw}px solid ${col('divider')};`;
     const useDiv = !!(d.divider && idRows && (contactsHtml || socialsHtml));
     body = (leftHtml ? R(leftHtml, 'padding-bottom:10px;') : '') +
       (idRows ? R(T(idRows), useDiv ? 'padding-bottom:8px;' : '') : '') +
-      (contactsHtml ? R(contactsHtml, 'padding-top:8px;' + (useDiv ? dv : '')) : '') +
-      (socialsHtml ? R(socialsHtml, 'padding-top:10px;' + (useDiv && !contactsHtml ? dv : '')) : '') +
+      (contactsHtml ? R(contactsHtml, 'padding-top:8px;' + (useDiv ? dv : ''), useDiv ? ['t', 'bd'] : ['t']) : '') +
+      (socialsHtml ? R(socialsHtml, 'padding-top:10px;' + (useDiv && !contactsHtml ? dv : ''), useDiv && !contactsHtml ? ['t', 'bd'] : ['t']) : '') +
       (logoBelow ? R(logoBelow, 'padding-top:10px;') : '');
   } else if (d.layout === 'compact') {
-    const nameInline = name ? `<span style="${nameStyle}">${esc(name)}</span>` : '';
-    const bits = [nameInline, titleParts.map(esc).join(', '), company ? `<span style="font-weight:bold;color:${col('accent')};">${esc(company)}</span>` : ''].filter(Boolean);
+    const nameInline = name ? `<span${K('n')} style="${nameStyle}">${esc(name)}</span>` : '';
+    const bits = [nameInline, titleParts.map(esc).join(', '), company ? `<span${K('a')} style="font-weight:bold;color:${col('accent')};">${esc(company)}</span>` : ''].filter(Boolean);
     const logoC = logoOK ? logoSmall(Math.min(lw, 110)) : '';
-    const lower = (logoC || socialsHtml) ? R(T('<tr>' + (logoC ? `<td valign="middle" style="${base}padding:0 ${socialsHtml ? 14 : 0}px 0 0;">${logoC}</td>` : '') + (socialsHtml ? `<td valign="middle" style="${base}">${socialsHtml}</td>` : '') + '</tr>'), 'padding-top:10px;') : '';
+    const lower = (logoC || socialsHtml) ? R(T('<tr>' + (logoC ? `<td valign="middle"${K('t')} style="${base}padding:0 ${socialsHtml ? 14 : 0}px 0 0;">${logoC}</td>` : '') + (socialsHtml ? `<td valign="middle"${K('t')} style="${base}">${socialsHtml}</td>` : '') + '</tr>'), 'padding-top:10px;') : '';
     body = R(bits.join(sep), '') + (contactsHtml ? R(contactsHtml, 'padding-top:3px;') : '') + lower;
   } else { // classic
     const detailRows = idRows +
@@ -354,13 +402,30 @@ function renderSignature(d, p, o) {
       (logoBelow ? R(logoBelow, 'padding-top:10px;') : '');
     const hasDiv = !!(leftHtml && d.divider);
     body = R(T('<tr>' +
-      (leftHtml ? `<td valign="top" style="${base}padding:0 ${gp}px 0 0;">${leftHtml}</td>` : '') +
-      `<td valign="top" style="${base}${hasDiv ? `border-left:${dw}px solid ${col('divider')};padding-left:${gp}px;` : ''}">${T(detailRows)}</td></tr>`), '');
+      (leftHtml ? `<td valign="top"${K('t')} style="${base}padding:0 ${gp}px 0 0;">${leftHtml}</td>` : '') +
+      `<td valign="top"${hasDiv ? K('t', 'bd') : K('t')} style="${base}${hasDiv ? `border-left:${dw}px solid ${col('divider')};padding-left:${gp}px;` : ''}">${T(detailRows)}</td></tr>`), '');
   }
-  return T(closing + body + bannerRow + disc, '', '');
+
+  // ---- dark-mode overrides (Apple Mail, iOS Mail, Outlook.com / Outlook for Mac; Gmail & classic Outlook ignore or auto-adjust)
+  let css = '';
+  if (mq) {
+    const dc = Object.assign({}, DEFAULT_DESIGN.dark.colors, dk.colors);
+    const ok = k => /^#[0-9a-f]{6}$/i.test(dc[k]) ? dc[k] : DEFAULT_DESIGN.dark.colors[k];
+    const rules = pre => [
+      `.sig-t{color:${ok('text')}!important}`, `.sig-n{color:${ok('name')}!important}`, `.sig-a{color:${ok('accent')}!important}`,
+      `.sig-l{color:${ok('link')}!important}`, `.sig-lb{color:${ok('label')}!important}`, `.sig-d{color:${ok('divider')}!important}`,
+      `.sig-bd{border-color:${ok('divider')}!important}`, `.sig-m{color:${ok('muted')}!important}`, `.sig-bg{background-color:${ok('accent')}!important}`,
+      '.sig-lt{display:none!important;max-height:0!important;overflow:hidden!important}', '.sig-dk{display:block!important;max-height:none!important;overflow:visible!important}'
+    ].map(r => pre + r).join('');
+    css = `<style type="text/css">@media (prefers-color-scheme:dark){${rules('')}}${rules('[data-ogsc] ')}</style>`;
+  }
+  return css + T(closing + body + bannerRow + disc, '');
 }
 
-function fullDoc(html) { return '<!DOCTYPE html>\n<html><head><meta charset="utf-8"><title>Email signature</title></head><body>\n' + html + '\n</body></html>'; }
+function fullDoc(html) {
+  const dark = html.indexOf('prefers-color-scheme') > -1;
+  return '<!DOCTYPE html>\n<html><head><meta charset="utf-8">' + (dark ? '<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">' : '') + '<title>Email signature</title></head><body>\n' + html + '\n</body></html>';
+}
 
 /* ---------- clipboard: copy rendered signature as rich HTML ---------- */
 async function copySignatureRich(html) {
@@ -481,7 +546,7 @@ function buildWorkspace(ctx) {
   const sigHtml = () => { const p = cur(); return renderSignature(ctx.getDesign(), p ? p.data : {}, { origin: location.origin, clientName: ctx.clientName, placeholder: false }); };
   const refreshPreview = () => {
     const p = cur();
-    preview.innerHTML = p ? renderSignature(ctx.getDesign(), p.data, { origin: location.origin, clientName: ctx.clientName, placeholder: true }) : '<span class="muted">Add a person to see their signature.</span>';
+    preview.innerHTML = p ? renderSignature(ctx.getDesign(), p.data, { origin: location.origin, clientName: ctx.clientName, placeholder: true, forceDark: stage === 'd' }) : '<span class="muted">Add a person to see their signature.</span>';
     stageEl.className = 'stage ' + stage + (mobile ? ' m' : '');
   };
   ctx.refresh = refreshPreview;
@@ -579,7 +644,8 @@ function buildWorkspace(ctx) {
     el('span', { style: 'flex:1' }),
     seg([['w', 'Light'], ['g', 'Grey'], ['d', 'Dark']], () => stage, v => stage = v),
     seg([['d', 'Desktop'], ['m', 'Mobile']], () => mobile ? 'm' : 'd', v => mobile = v === 'm'));
-  right.append(el('div', { class: 'card' }, el('h3', { style: 'margin-bottom:12px' }, 'Your signature'), actions, stageEl));
+  const dkNote = () => ctx.getDesign().dark && ctx.getDesign().dark.on ? el('div', { class: 'note small', style: 'margin:12px 0 0' }, 'This signature includes a dark-mode version. To keep it, install with ', el('b', {}, 'Copy HTML'), ' or ', el('b', {}, 'Download .html file'), ' (Thunderbird, or Outlook/Apple Mail via an HTML signature file). “Copy signature” pastes the light design, which still reads fine on dark.') : null;
+  right.append(el('div', { class: 'card' }, el('h3', { style: 'margin-bottom:12px' }, 'Your signature'), actions, stageEl, dkNote()));
   if (ctx.guide) right.append(el('div', { class: 'card', style: 'margin-top:16px' }, el('h3', { style: 'margin-bottom:6px' }, 'How to install it'), buildGuide()));
   renderLeft(); refreshPreview();
   return root;
@@ -614,12 +680,12 @@ async function adminList() {
     const url = location.origin + '/c/' + c.slug;
     tbody.append(el('tr', { class: 'click', onclick: () => adminClient(c.id) },
       el('td', {}, el('b', {}, c.name)), el('td', {}, c.people), el('td', { class: 'muted small' }, url),
-      el('td', { class: 'muted small' }, new Date(c.updated_at).toLocaleDateString()),
+      el('td', { class: 'muted small' }, c.last_client_edit ? new Date(c.last_client_edit).toLocaleDateString([], { dateStyle: 'medium' }) : '—'),
       el('td', {}, el('button', { class: 'btn sm', onclick: e => { e.stopPropagation(); copyText(url); } }, 'Copy link'))));
   });
   app.append(topbar(el('div', { class: 'inl' }, el('button', { class: 'btn pri', onclick: newClientModal }, '+ New client'), el('button', { class: 'btn', onclick: async () => { await api('POST', '/api/admin/logout'); adminLogin(); } }, 'Sign out'))),
     el('div', { class: 'wrap' }, el('h2', { style: 'margin-bottom:14px' }, 'Clients'),
-      clients.length ? el('div', { class: 'card', style: 'padding:0;overflow:auto' }, el('table', { class: 'list' }, el('thead', {}, el('tr', {}, el('th', {}, 'Client'), el('th', {}, 'People'), el('th', {}, 'Portal link'), el('th', {}, 'Updated'), el('th'))), tbody))
+      clients.length ? el('div', { class: 'card', style: 'padding:0;overflow:auto' }, el('table', { class: 'list' }, el('thead', {}, el('tr', {}, el('th', {}, 'Client'), el('th', {}, 'People'), el('th', {}, 'Portal link'), el('th', {}, 'Last client edit'), el('th'))), tbody))
         : el('div', { class: 'card muted' }, 'No clients yet. Click “New client” to design the first signature.')));
 }
 function credsModal(title, slug, password, then) {
@@ -663,7 +729,11 @@ async function adminClient(id) {
   const body = el('div', { class: 'wrap' });
   window.onbeforeunload = () => st.dirty ? 'Unsaved changes' : undefined;
   const setDirty = v => { st.dirty = v; saveBtn.disabled = !v; dirtyTag.textContent = v ? 'Unsaved' : 'Saved'; dirtyTag.className = 'pill ' + (v ? 'bad' : 'ok'); };
-  st.changed = () => { setDirty(true); if (st.refreshPreview) st.refreshPreview(); };
+  st.hist = []; st.last = clone(st.design); let lastPush = 0;
+  st.changed = (fromUndo, force) => {
+    if (!fromUndo) { const now = Date.now(); if (force || now - lastPush > 600) { st.hist.push(st.last); if (st.hist.length > 30) st.hist.shift(); lastPush = now; } st.last = clone(st.design); }
+    setDirty(true); if (st.refreshPreview) st.refreshPreview(); if (st.afterChange) st.afterChange();
+  };
   async function save() {
     try {
       const r = await api('PUT', '/api/admin/clients/' + id, { name: st.name, slug: st.slug, notes: st.notes, design: st.design });
@@ -672,16 +742,18 @@ async function adminClient(id) {
   }
   const back = async () => { if (st.dirty && !await confirmBox('Discard unsaved changes?', 'You have changes that are not saved.', 'Discard', true)) return; window.onbeforeunload = null; adminList(); };
   const tabs = el('div', { class: 'tabs' });
-  const tabDefs = [['design', 'Design'], ['people', 'People'], ['access', 'Access & settings']];
+  const tabDefs = [['design', 'Design'], ['people', 'People'], ['activity', 'Activity'], ['access', 'Access & settings']];
   const renderTabs = () => { tabs.innerHTML = ''; tabDefs.forEach(([k, l]) => tabs.append(el('button', { class: st.tab === k ? 'on' : '', onclick: () => { st.tab = k; renderTabs(); renderBody(); } }, l))); };
   function renderBody() {
     body.innerHTML = ''; st.refreshPreview = null;
     if (st.tab === 'design') body.append(designTab(st));
     else if (st.tab === 'people') {
+      if (st.peopleStale) { st.peopleStale = false; api('GET', '/api/admin/clients/' + id).then(r => { st.people.splice(0, st.people.length, ...r.people); renderBody(); }); return; }
       if (st.dirty) body.append(el('div', { class: 'note' }, 'You have unsaved design changes — the preview below already reflects them.'));
       const ctx = { base: '/api/admin/clients/' + id, getDesign: () => st.design, people: st.people, perm: { add: true, remove: true, photo: true }, clientName: st.name, guide: false };
       body.append(buildWorkspace(ctx));
-    } else body.append(accessTab(st, setDirty, id));
+    } else if (st.tab === 'activity') body.append(activityTab(st, id));
+    else body.append(accessTab(st, setDirty, id));
   }
   app.append(topbar(el('div', { class: 'inl' }, dirtyTag, saveBtn)),
     el('div', { class: 'wrap', style: 'padding-bottom:0' }, el('div', { class: 'inl', style: 'margin-bottom:10px' }, el('button', { class: 'btn sm', onclick: back }, '← Clients'), el('h2', {}, st.name)), tabs), body);
@@ -697,12 +769,18 @@ function mkCtl(st) {
   return {
     wrap,
     text: (label, path, ph, hint, area) => { const i = area ? el('textarea', { rows: 3, placeholder: ph || '' }) : el('input', { type: 'text', placeholder: ph || '' }); i.value = getP(st.design, path) || ''; i.oninput = () => { setP(st.design, path, i.value); fire(); }; return wrap(label, i, hint); },
-    color: (label, path) => {
-      const c = el('input', { type: 'color', value: getP(st.design, path) });
-      const t = el('input', { type: 'text', value: getP(st.design, path), style: 'width:92px', maxlength: 7 });
-      c.oninput = () => { t.value = c.value; setP(st.design, path, c.value); fire(); };
-      t.oninput = () => { if (/^#[0-9a-f]{6}$/i.test(t.value)) { c.value = t.value; setP(st.design, path, t.value); fire(); } };
-      return wrap(label, el('div', { class: 'inl' }, c, t));
+    color: (label, path, against) => {
+      const cur = () => getP(st.design, path) || '';
+      const isHex = v => /^#[0-9a-f]{6}$/i.test(v);
+      const c = el('input', { type: 'color', value: isHex(cur()) ? cur() : '#000000' });
+      const t = el('input', { type: 'text', value: cur(), style: 'width:92px', maxlength: 7 });
+      const hint = el('span', { class: 'small' });
+      const paint = () => { if (!against || !isHex(cur())) { hint.textContent = ''; return; } const r = contrast(cur(), against); hint.textContent = r >= 4.5 ? '✓ readable' : `⚠ low contrast (${r.toFixed(1)}:1)`; hint.style.color = r >= 4.5 ? 'var(--ok)' : 'var(--bad)'; };
+      c.oninput = () => { t.value = c.value; setP(st.design, path, c.value); paint(); fire(); };
+      t.oninput = () => { if (isHex(t.value)) { c.value = t.value; setP(st.design, path, t.value); paint(); fire(); } else if (t.value === '' && path === 'socials.bg') { setP(st.design, path, ''); fire(); } };
+      paint();
+      (st.syncers || (st.syncers = [])).push(() => { t.value = cur(); if (isHex(cur())) c.value = cur(); paint(); });
+      return wrap(label, el('div', { class: 'inl' }, c, t, hint));
     },
     range: (label, path, min, max, step, unit) => { const v = el('span', { class: 'val' }, getP(st.design, path) + (unit || '')); const r = el('input', { type: 'range', min, max, step: step || 1, value: getP(st.design, path) }); r.oninput = () => { setP(st.design, path, +r.value); v.textContent = r.value + (unit || ''); fire(); }; return wrap(label, el('div', { class: 'inl' }, r, v)); },
     check: (label, path, after) => { const c = el('input', { type: 'checkbox', checked: !!getP(st.design, path) }); c.onchange = () => { setP(st.design, path, c.checked); fire(); if (after) after(); }; return el('label', { class: 'chk' }, c, label); },
@@ -741,32 +819,107 @@ function imageUploader(st, kind, label, slotPath, maxW, hint) {
   return st.ctl.wrap(label, el('div', {}, thumb, el('div', { class: 'inl' }, el('button', { class: 'btn sm', onclick: () => fi.click() }, slot.id ? 'Replace' : 'Upload'), slot.id ? el('button', { class: 'btn sm', onclick: () => { const s = getP(st.design, slotPath); s.id = ''; s.w = s.h = 0; st.changed(); paint(); if (st.rerenderSection) st.rerenderSection(); } }, 'Remove') : null, fi), info));
 }
 
+/* ---------- presets: one-click starting points, driven by the brand colour ---------- */
+const PRESETS = [
+  { id: 'clean', name: 'Clean', patch: b => ({ layout: 'classic', divider: true, dividerWidth: 1, font: FONTS[0][0], size: 13, nameSize: 17, labels: 'letter', rowGap: 3, underline: false, colors: { accent: b, link: b, label: b, name: '#111111', text: '#444444', divider: '#d9d9d9' }, socials: { style: 'square' }, photo: { shape: 'round' } }) },
+  { id: 'bold', name: 'Bold', patch: b => ({ layout: 'classic', divider: true, dividerWidth: 4, font: FONTS[4][0], size: 13, nameSize: 21, labels: 'letter', rowGap: 3, underline: false, colors: { accent: b, link: '#222222', label: b, name: '#0d0d0d', text: '#333333', divider: b }, socials: { style: 'circle' }, photo: { shape: 'round' } }) },
+  { id: 'minimal', name: 'Minimal', patch: b => ({ layout: 'compact', divider: false, font: FONTS[0][0], size: 12, nameSize: 15, labels: 'none', rowGap: 2, underline: false, colors: { accent: b, link: '#555555', label: b, name: '#111111', text: '#555555', divider: '#c9c9c9' }, socials: { style: 'text' } }) },
+  { id: 'corporate', name: 'Corporate', patch: b => ({ layout: 'classic', divider: true, dividerWidth: 1, font: FONTS[1][0], size: 12, nameSize: 16, labels: 'word', rowGap: 4, underline: false, colors: { accent: b, link: b, label: '#6b7280', name: '#1f2937', text: '#4b5563', divider: '#cbd5e1' }, socials: { style: 'rounded' }, photo: { shape: 'square' } }) },
+  { id: 'editorial', name: 'Editorial', patch: b => ({ layout: 'stacked', divider: true, dividerWidth: 1, font: FONTS[7][0], size: 14, nameSize: 22, labels: 'none', rowGap: 3, underline: true, colors: { accent: b, link: '#222222', label: b, name: '#111111', text: '#444444', divider: '#222222' }, socials: { style: 'text' } }) },
+  { id: 'friendly', name: 'Friendly', patch: b => ({ layout: 'classic', divider: false, font: FONTS[3][0], size: 13, nameSize: 18, labels: 'letter', rowGap: 4, underline: false, colors: { accent: b, link: b, label: b, name: '#222222', text: '#4a4a4a', divider: '#e0e0e0' }, socials: { style: 'circle', size: 28 }, photo: { shape: 'round' } }) }
+];
+
+function iconUploader(st, label, onDone) {
+  const fi = el('input', { type: 'file', accept: 'image/png,image/jpeg,image/gif', class: 'hide', onchange: async e => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    try {
+      const { blob, w, h } = await prepDesignImage(f, 160);
+      const r = await api('POST', `/api/admin/clients/${st.id}/images?kind=asset`, blob);
+      onDone(r.id, w, h);
+    } catch (er) { toast(er.message); }
+  } });
+  return el('span', {}, el('button', { class: 'btn sm', onclick: () => fi.click() }, label), fi);
+}
+
 function designTab(st) {
   st.ctl = mkCtl(st);
-  const c = st.ctl, d = st.design;
+  const c = st.ctl;
   const right = el('div', { class: 'sticky' });
   const stageEl = el('div', { class: 'stage w' }), inner = el('div', { class: 'inner' }); stageEl.append(inner);
   const personSel = el('select', { style: 'width:auto;min-width:150px' });
+  const person = () => (!st.sample && st.people[st.previewIdx]) ? st.people[st.previewIdx].data : {};
   const refresh = () => {
-    const person = (!st.sample && st.people[st.previewIdx]) ? st.people[st.previewIdx].data : {};
-    inner.innerHTML = renderSignature(st.design, person, { origin: location.origin, clientName: st.name, sample: st.sample, placeholder: true });
+    inner.innerHTML = renderSignature(st.design, person(), { origin: location.origin, clientName: st.name, sample: st.sample, placeholder: true, forceDark: st.stage === 'd' });
     stageEl.className = 'stage ' + st.stage + (st.mobile ? ' m' : '');
   };
   st.refreshPreview = refresh;
   const personOpts = () => { personSel.innerHTML = ''; personSel.append(el('option', { value: 'sample' }, 'Sample data')); st.people.forEach((p, i) => personSel.append(el('option', { value: i }, p.data.name || '(unnamed)'))); personSel.value = st.sample ? 'sample' : String(st.previewIdx); };
   personSel.onchange = () => { if (personSel.value === 'sample') st.sample = true; else { st.sample = false; st.previewIdx = +personSel.value; } refresh(); };
   personOpts();
-  const seg = (opts, get, set) => { const s = el('div', { class: 'seg' }); const paint = () => { s.innerHTML = ''; opts.forEach(([v, l]) => s.append(el('button', { class: get() === v ? 'on' : '', onclick: () => { set(v); paint(); refresh(); } }, l))); }; paint(); return s; };
+  const darkHint = el('div', { class: 'muted small', style: 'margin-top:8px' });
+  const paintHint = () => { darkHint.textContent = st.stage === 'd' ? (st.design.dark.on ? 'Showing your dark-mode version.' : 'Dark mode version is off — this is how the light design looks on a dark background. Turn it on under “Dark mode”.') : ''; };
+  const seg = (opts, get, set) => { const s = el('div', { class: 'seg' }); const paint = () => { s.innerHTML = ''; opts.forEach(([v, l]) => s.append(el('button', { class: get() === v ? 'on' : '', onclick: () => { set(v); paint(); refresh(); paintHint(); } }, l))); }; paint(); return s; };
   right.append(el('div', { class: 'card' }, el('div', { class: 'bar' }, personSel, el('span', { style: 'flex:1' }),
     seg([['w', 'Light'], ['g', 'Grey'], ['d', 'Dark']], () => st.stage, v => st.stage = v), seg([['d', 'Desktop'], ['m', 'Mobile']], () => st.mobile ? 'm' : 'd', v => st.mobile = v === 'm')),
-    stageEl,
-    el('div', { class: 'bar', style: 'margin:12px 0 0' }, el('button', { class: 'btn sm', onclick: () => copyText(renderSignature(st.design, st.sample ? SAMPLE : (st.people[st.previewIdx] || { data: {} }).data, { origin: location.origin, clientName: st.name, sample: st.sample })) }, 'Copy HTML'),
-      el('span', { class: 'muted small' }, 'Images use your live URL, so test sends only render images once deployed.'))));
+    stageEl, darkHint,
+    el('div', { class: 'bar', style: 'margin:12px 0 0' }, el('button', { class: 'btn sm', onclick: () => copyText(renderSignature(st.design, st.sample ? SAMPLE : person(), { origin: location.origin, clientName: st.name, sample: st.sample })) }, 'Copy HTML'),
+      el('span', { class: 'muted small' }, 'Images use your live URL, so test sends only show images once deployed.'))));
 
   const ctl = el('div', { class: 'ctl' });
+  const brand = () => st.design.colors.accent;
+  const setBrand = hex => {
+    const d = st.design; d.colors.accent = d.colors.link = d.colors.label = hex;
+    if (d.dark.on) { const dc = d.dark.colors; dc.accent = dc.link = dc.label = ensureContrast(hex, DARK_BG, 4.5); }
+    (st.syncers || []).forEach(f => f());
+  };
+  const thumbs = {};
+  const paintThumbs = () => PRESETS.forEach(pr => {
+    const dd = deepMerge(clone(st.design), pr.patch(brand())); dd.dark.on = false;
+    if (thumbs[pr.id]) thumbs[pr.id].innerHTML = renderSignature(dd, SAMPLE, { origin: location.origin, clientName: st.name, sample: true, placeholder: true });
+  });
+  const paintThumbsSoon = debounce(paintThumbs, 200);
+  st.afterChange = paintThumbsSoon;
+  const applyPreset = pr => { deepMerge(st.design, pr.patch(brand())); if (st.design.dark.on) st.design.dark.colors = autoDark(st.design.colors); st.changed(false, true); build(); refresh(); };
+  const pick = a => a[Math.floor(Math.random() * a.length)];
+  const shuffle = () => {
+    applyPreset(pick(PRESETS));
+    const d = st.design;
+    d.layout = pick(['classic', 'classic', 'stacked', 'compact']); d.socials.style = pick(['square', 'rounded', 'circle', 'text']);
+    d.font = pick(FONTS)[0]; d.divider = Math.random() > .3; d.nameSize = pick([16, 17, 18, 20, 22]);
+    st.changed(false, true); build(); refresh();
+  };
+  const undo = () => {
+    if (!st.hist.length) return toast('Nothing to undo');
+    st.design = st.hist.pop(); st.last = clone(st.design); st.changed(true); build(); refresh();
+  };
+
   const build = () => {
-    const keepScroll = ctl.scrollTop;
+    const keepScroll = ctl.scrollTop, d = st.design;
+    st.syncers = [];
     ctl.innerHTML = '';
+    // ----- quick design
+    const grid = el('div', { class: 'presets' });
+    PRESETS.forEach(pr => {
+      const t = el('div', { class: 'thumb' }); thumbs[pr.id] = t;
+      grid.append(el('button', { class: 'pbtn', title: 'Apply ' + pr.name, onclick: () => applyPreset(pr) }, t, el('span', {}, pr.name)));
+    });
+    const hex = el('input', { type: 'text', value: brand(), style: 'width:92px', maxlength: 7 });
+    const pk = el('input', { type: 'color', value: brand() });
+    pk.oninput = () => { hex.value = pk.value; setBrand(pk.value); st.changed(); };
+    hex.oninput = () => { if (/^#[0-9a-f]{6}$/i.test(hex.value)) { pk.value = hex.value; setBrand(hex.value); st.changed(); } };
+    ctl.append(el('div', { class: 'card quick' },
+      el('div', { class: 'inl', style: 'margin-bottom:10px' }, el('h3', { style: 'flex:1' }, 'Start here'),
+        el('button', { class: 'btn sm', title: 'Try a random combination', onclick: shuffle }, '🎲 Surprise me'),
+        el('button', { class: 'btn sm', onclick: undo }, '↶ Undo')),
+      grid,
+      c.wrap('Brand colour', el('div', { class: 'inl' }, pk, hex, el('span', { class: 'muted small' }, 'sets accent, links and icons')), null),
+      imageUploader(st, 'logo', 'Logo', 'logo', 700, 'PNG with a transparent background works best.'),
+      d.logo.id ? c.range('Logo width', 'logo.width', 40, 260, 1, 'px') : null,
+      el('div', { class: 'muted small' }, 'Presets keep your logo, fields and social links — they only change the look.')));
+    paintThumbs();
+
+    // ----- fine tune
+    ctl.append(el('div', { class: 'lbl', style: 'margin:14px 2px 8px' }, 'Fine-tune'));
     const layoutBtns = el('div', { class: 'layouts' });
     [['classic', 'Classic'], ['stacked', 'Stacked'], ['compact', 'Compact']].forEach(([k, l]) => {
       const m = el('div', { class: 'mini' });
@@ -776,31 +929,43 @@ function designTab(st) {
       layoutBtns.append(el('button', { class: d.layout === k ? 'on' : '', onclick: () => { d.layout = k; st.changed(); build(); } }, m, l));
     });
     st.rerenderSection = build;
+    const light = '#ffffff';
     ctl.append(
-      section('Layout', true, layoutBtns,
+      section('Layout', false, layoutBtns,
         d.layout !== 'compact' ? c.select('Main image', 'imageSlot', [['logo', 'Company logo'], ['photo', 'Person’s photo'], ['none', 'None']], build) : null,
         d.layout !== 'compact' && d.imageSlot === 'photo' ? c.check('Also show logo under the details', 'logoWithPhoto') : null,
         d.layout !== 'compact' ? c.check('Divider line', 'divider') : null,
         c.select('Contact labels', 'labels', [['letter', 'Letters (T, M, E, W)'], ['word', 'Words (Phone, Email…)'], ['none', 'None']]),
-        c.range('Space between image and text', 'gap', 6, 32, 1, 'px'), c.range('Row spacing', 'rowGap', 0, 8, 1, 'px')),
-      section('Brand', true, imageUploader(st, 'logo', 'Logo', 'logo', 700, 'PNG with transparent background works best. Upload at 2× the size you need.'),
-        d.logo.id ? c.range('Logo width', 'logo.width', 40, 260, 1, 'px') : null, d.logo.id ? c.text('Logo alt text', 'logo.alt', st.name) : null,
-        c.color('Accent colour', 'colors.accent'), c.color('Name colour', 'colors.name'), c.color('Text colour', 'colors.text'), c.color('Link colour', 'colors.link'), c.color('Label colour', 'colors.label'), c.color('Divider colour', 'colors.divider')),
-      section('Text', false, c.select('Font', 'font', FONTS), c.range('Text size', 'size', 10, 16, 1, 'px'), c.range('Name size', 'nameSize', 13, 26, 1, 'px'), c.check('Underline links', 'underline')),
+        c.range('Space between image and text', 'gap', 6, 32, 1, 'px'), c.range('Row spacing', 'rowGap', 0, 8, 1, 'px'), c.range('Divider thickness', 'dividerWidth', 1, 6, 1, 'px')),
+      section('Colours', false, c.color('Name', 'colors.name', light), c.color('Text', 'colors.text', light), c.color('Links', 'colors.link', light), c.color('Labels (T, M, E…)', 'colors.label', light), c.color('Accent (company, icons)', 'colors.accent'), c.color('Divider', 'colors.divider'), c.color('Small print', 'colors.muted')),
+      section('Text', false, c.select('Font', 'font', FONTS), c.range('Text size', 'size', 10, 16, 1, 'px'), c.range('Name size', 'nameSize', 13, 26, 1, 'px'), c.check('Underline links', 'underline'),
+        c.text('Sign-off line (above signature)', 'closing', 'e.g. Kind regards,', 'Optional.')),
       section('Photo', false, c.range('Photo size', 'photo.size', 60, 130, 2, 'px'), c.select('Shape', 'photo.shape', [['round', 'Round'], ['square', 'Square']]),
-        el('div', { class: 'muted small' }, 'Photos appear when “Main image” is set to Person’s photo. Round photos are pre-cropped so they stay round in Outlook.')),
+        el('div', { class: 'muted small' }, 'Shown when “Main image” is set to Person’s photo. Round photos are pre-cropped so they stay round in Outlook.')),
       section('Fields', false, el('div', { class: 'muted small', style: 'margin-bottom:8px' }, 'Choose what clients can fill in. Contact line order can be changed.'), fieldsEditor(st, build)),
-      section('Social icons', false, c.select('Style', 'socials.style', [['square', 'Square icons'], ['rounded', 'Rounded icons'], ['circle', 'Circle icons'], ['text', 'Text links']]),
-        d.socials.style !== 'text' ? c.range('Icon size', 'socials.size', 20, 40, 1, 'px') : null, d.socials.style !== 'text' ? c.range('Icon spacing', 'socials.gap', 2, 14, 1, 'px') : null, socialsEditor(st, build),
-        el('div', { class: 'muted small' }, 'Circle/rounded corners show as squares in classic Outlook for Windows — everything else is identical.')),
+      section('Social icons', false, c.select('Style', 'socials.style', [['square', 'Square tiles'], ['rounded', 'Rounded tiles'], ['circle', 'Circle tiles'], ['text', 'Text links']], build),
+        d.socials.style !== 'text' ? [c.range('Icon size', 'socials.size', 20, 40, 1, 'px'), c.range('Icon spacing', 'socials.gap', 2, 14, 1, 'px'), c.color('Tile colour (blank = accent)', 'socials.bg')] : null,
+        socialsEditor(st, build),
+        el('div', { class: 'muted small' }, 'Circle/rounded corners show as squares in classic Outlook for Windows. Uploaded icons are shown exactly as supplied.')),
       section('Banner', false, c.check('Show banner under signature', 'banner.on', build),
         d.banner.on ? [imageUploader(st, 'banner', 'Banner image', 'banner', 1000, 'Campaign or promo image. Upload at 2× the display width.'), c.range('Banner width', 'banner.width', 200, 600, 1, 'px'), c.text('Link URL', 'banner.link', 'https://'), c.text('Alt text', 'banner.alt', 'Describe the banner')] : null),
-      section('Sign-off & disclaimer', false, c.text('Sign-off line (above signature)', 'closing', 'e.g. Kind regards,', 'Optional.'), c.check('Show legal disclaimer', 'disclaimer.on', build),
-        d.disclaimer.on ? c.text('Disclaimer text', 'disclaimer.text', '', '', true) : null)
+      section('Dark mode', false,
+        el('div', { class: 'muted small', style: 'margin-bottom:10px' }, 'Two ways to look good in dark mode. Pick one — or both.'),
+        el('div', { class: 'fld' }, el('button', { class: 'btn sm', onclick: () => { const dc = st.design.colors; ['name', 'text', 'link', 'label', 'accent', 'muted'].forEach(k => dc[k] = darkSafe(dc[k])); dc.divider = '#8a8a8a'; st.changed(false, true); build(); refresh(); } }, 'Make my colours dark-safe'),
+          el('div', { class: 'muted small', style: 'margin-top:4px' }, 'Nudges colours to mid-tones that read on both white and dark. Works everywhere, including Gmail and normal copy-paste.')),
+        c.check('Also include a dedicated dark version', 'dark.on', () => { if (st.design.dark.on) st.design.dark.colors = autoDark(st.design.colors); st.changed(false, true); build(); }),
+        d.dark.on ? [
+          el('div', { class: 'muted small', style: 'margin-bottom:10px' }, 'Switches colours (and logo) automatically in Apple Mail, iOS Mail, Outlook.com and Outlook for Mac. It only travels with Copy HTML / Download .html — a normal “Copy signature” paste keeps just the light design. Preview with the Dark button.'),
+          el('div', { style: 'margin-bottom:10px' }, el('button', { class: 'btn sm', onclick: () => { st.design.dark.colors = autoDark(st.design.colors); st.changed(); build(); } }, 'Auto-generate from my colours')),
+          c.color('Name', 'dark.colors.name', DARK_BG), c.color('Text', 'dark.colors.text', DARK_BG), c.color('Links', 'dark.colors.link', DARK_BG), c.color('Labels', 'dark.colors.label', DARK_BG),
+          c.color('Accent (company, icons)', 'dark.colors.accent'), c.color('Divider', 'dark.colors.divider'), c.color('Small print', 'dark.colors.muted'),
+          imageUploader(st, 'asset', 'Logo for dark backgrounds (optional)', 'dark.logo', 700, 'e.g. a white version of your logo.')
+        ] : null),
+      section('Legal disclaimer', false, c.check('Show disclaimer', 'disclaimer.on', build), d.disclaimer.on ? c.text('Disclaimer text', 'disclaimer.text', '', '', true) : null)
     );
     ctl.scrollTop = keepScroll;
   };
-  build(); refresh();
+  build(); refresh(); paintHint();
   return el('div', { class: 'split' }, ctl, right);
 }
 
@@ -829,16 +994,93 @@ function fieldsEditor(st, rebuild) {
   return wrap;
 }
 function socialsEditor(st, rebuild) {
-  const wrap = el('div');
+  const wrap = el('div'), socials = () => st.design.socials;
   Object.keys(NETS).forEach(k => {
-    const c = st.design.socials.items[k];
+    const c = socials().items[k];
     const cb = el('input', { type: 'checkbox', checked: c.on }); cb.onchange = () => { c.on = cb.checked; st.changed(); rebuild(); };
     const url = el('input', { type: 'text', value: c.url, placeholder: 'Company ' + NETS[k] + ' URL' }); url.oninput = () => { c.url = url.value; st.changed(); };
     const pp = el('input', { type: 'checkbox', checked: c.perPerson }); pp.onchange = () => { c.perPerson = pp.checked; st.changed(); };
+    const icon = c.on && socials().style !== 'text' ? el('div', { class: 'inl', style: 'margin-top:6px' },
+      c.iconId ? el('img', { src: '/i/' + c.iconId, style: 'height:24px;max-width:60px' }) : null,
+      iconUploader(st, c.iconId ? 'Replace custom icon' : 'Use my own icon', (id, w, h) => { c.iconId = id; c.iw = w; c.ih = h; st.changed(); rebuild(); }),
+      c.iconId ? el('button', { class: 'btn sm', onclick: () => { c.iconId = ''; c.iw = c.ih = 0; st.changed(); rebuild(); } }, 'Use standard') : null) : null;
     wrap.append(el('div', { class: 'fld' }, el('label', { class: 'chk', style: 'margin-bottom:4px' }, cb, NETS[k]),
-      c.on ? el('div', {}, url, el('label', { class: 'chk small', style: 'margin:4px 0 0' }, pp, 'Let each person add their own profile link')) : null));
+      c.on ? el('div', {}, url, el('label', { class: 'chk small', style: 'margin:4px 0 0' }, pp, 'Let each person add their own profile link'), icon) : null));
   });
+  // custom links (Google Reviews, Behance, a booking page…)
+  const list = socials().custom || (socials().custom = []);
+  wrap.append(el('div', { class: 'lbl', style: 'margin-top:12px' }, 'Other links'));
+  list.forEach((it, idx) => {
+    const label = el('input', { type: 'text', value: it.label || '', placeholder: 'Name (e.g. Google Reviews)' }); label.oninput = () => { it.label = label.value; st.changed(); };
+    const url = el('input', { type: 'text', value: it.url || '', placeholder: 'https://' }); url.oninput = () => { it.url = url.value; st.changed(); };
+    wrap.append(el('div', { class: 'fld card', style: 'padding:10px' }, label, el('div', { style: 'height:6px' }), url,
+      el('div', { class: 'inl', style: 'margin-top:6px' }, it.iconId ? el('img', { src: '/i/' + it.iconId, style: 'height:24px;max-width:60px' }) : null,
+        iconUploader(st, it.iconId ? 'Replace icon' : 'Upload icon', (id, w, h) => { it.iconId = id; it.w = w; it.h = h; st.changed(); rebuild(); }),
+        el('span', { style: 'flex:1' }), el('button', { class: 'btn sm dng', onclick: () => { list.splice(idx, 1); st.changed(); rebuild(); } }, 'Remove'))));
+  });
+  if (list.length < 6) wrap.append(el('button', { class: 'btn sm', onclick: () => { list.push({ label: '', url: '', iconId: '', w: 0, h: 0 }); st.changed(); rebuild(); } }, '+ Add a link'));
   return wrap;
+}
+
+function activityTab(st, id) {
+  const ACTIONS = { 'person.create': 'added a person', 'person.update': 'edited details', 'person.delete': 'removed a person', 'person.photo': 'changed a photo', 'person.revert': 'reverted an edit', 'person.restore': 'restored a person', 'design.update': 'changed the design', 'client.rename': 'renamed the client', 'client.slug': 'changed the link code', 'password.reset': 'reset the password', login: 'signed in', login_failed: 'failed to sign in' };
+  const fieldLabel = k => { const f = (st.design.fields || []).find(x => x.key === k); if (f) return f.label; if (k.startsWith('social_')) return (NETS[k.slice(7)] || k) + ' link'; return k; };
+  const pretty = k => k.replace(/\./g, ' › ');
+  const q = { actor: '', logins: false }; let rows = [], more = false;
+  const list = el('div', { class: 'card', style: 'padding:0;overflow:auto' });
+  const loadBtn = el('button', { class: 'btn', onclick: () => load(false) }, 'Load more');
+  const detail = r => {
+    const ch = r.changes || {};
+    if (r.action === 'person.delete') { const s = ch.snapshot || {}; return [s.name, s.title, s.email].filter(Boolean).join(' · ') || '(empty record)'; }
+    if (r.action.startsWith('login')) return r.ip ? 'from ' + r.ip : '';
+    const keys = Object.keys(ch);
+    const out = el('div');
+    keys.slice(0, 8).forEach(k => {
+      const [o, n] = ch[k]; const fmt = v => v === '' || v == null ? el('i', { class: 'muted' }, '(empty)') : '“' + v + '”';
+      out.append(el('div', { class: 'small' }, el('b', {}, (r.action.startsWith('design') ? pretty(k) : fieldLabel(k)) + ': '), fmt(o), ' → ', fmt(n)));
+    });
+    if (keys.length > 8) out.append(el('div', { class: 'small muted' }, '+ ' + (keys.length - 8) + ' more'));
+    return out;
+  };
+  const revert = async r => {
+    const label = r.action === 'person.delete' ? 'Restore this person?' : 'Revert this edit?';
+    if (!await confirmBox(label, r.action === 'person.delete' ? 'They will be re-added with the details they had when removed.' : 'The changed fields go back to their earlier values (recorded in the log).', r.action === 'person.delete' ? 'Restore' : 'Revert')) return;
+    try { await api('POST', `/api/admin/clients/${id}/audit/${r.id}/revert`); toast('Done'); st.peopleStale = true; load(true); } catch (e) { toast(e.message); }
+  };
+  const paint = () => {
+    list.innerHTML = '';
+    if (!rows.length) { list.append(el('div', { class: 'muted', style: 'padding:16px' }, 'No activity yet.')); loadBtn.classList.add('hide'); return; }
+    const tb = el('tbody');
+    rows.forEach(r => tb.append(el('tr', {},
+      el('td', { class: 'small', style: 'white-space:nowrap', title: new Date(r.at).toLocaleString() }, new Date(r.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })),
+      el('td', {}, el('span', { class: 'pill ' + (r.actor === 'client' ? 'ok' : '') }, r.actor === 'client' ? 'Client' : 'You')),
+      el('td', {}, el('b', {}, ACTIONS[r.action] || r.action), r.person_name ? el('div', { class: 'muted small' }, r.person_name) : null),
+      el('td', {}, detail(r)),
+      el('td', {}, (r.action === 'person.update' || r.action === 'person.delete') ? el('button', { class: 'btn sm', onclick: () => revert(r) }, r.action === 'person.delete' ? 'Restore' : 'Revert') : null))));
+    list.append(el('table', { class: 'list' }, el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Who'), el('th', {}, 'What'), el('th', {}, 'Details'), el('th'))), tb));
+    loadBtn.classList.toggle('hide', !more);
+  };
+  async function load(reset) {
+    try {
+      const qs = new URLSearchParams({ limit: 50 }); if (q.actor) qs.set('actor', q.actor); if (q.logins) qs.set('logins', '1'); if (!reset && rows.length) qs.set('before', rows[rows.length - 1].id);
+      const r = await api('GET', `/api/admin/clients/${id}/audit?${qs}`);
+      rows = reset ? r.rows : rows.concat(r.rows); more = r.more; paint();
+    } catch (e) { toast(e.message); }
+  }
+  const exportCsv = () => {
+    const cell = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const lines = [['When', 'Who', 'Action', 'Person', 'Details', 'IP'].join(',')].concat(rows.map(r => {
+      const ch = r.changes || {}; const det = r.action === 'person.delete' ? JSON.stringify(ch.snapshot || {}) : Object.keys(ch).map(k => `${r.action.startsWith('design') ? k : fieldLabel(k)}: ${ch[k][0]} -> ${ch[k][1]}`).join('; ');
+      return [new Date(r.at).toISOString(), r.actor, r.action, r.person_name, det, r.ip].map(cell).join(',');
+    }));
+    download('signature-activity.csv', lines.join('\n'), 'text/csv');
+  };
+  const who = el('select', { style: 'width:auto', onchange: e => { q.actor = e.target.value; load(true); } }, el('option', { value: '' }, 'Everyone'), el('option', { value: 'client' }, 'Client only'), el('option', { value: 'admin' }, 'Me only'));
+  const lg = el('label', { class: 'chk', style: 'margin:0' }, el('input', { type: 'checkbox', onchange: e => { q.logins = e.target.checked; load(true); } }), 'Show sign-ins');
+  const root = el('div', { style: 'max-width:1000px' }, el('div', { class: 'bar' }, who, lg, el('span', { style: 'flex:1' }), el('button', { class: 'btn', onclick: exportCsv }, 'Export CSV')), list, el('div', { style: 'margin-top:12px;text-align:center' }, loadBtn),
+    el('p', { class: 'muted small' }, 'Consecutive edits to the same person are merged into one entry. Photos and logos are never deleted, so reverting always keeps images intact.'));
+  load(true);
+  return root;
 }
 
 function accessTab(st, setDirty, id) {
